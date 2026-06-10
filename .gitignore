@@ -1,13 +1,5 @@
 __pycache__/
 *.pyc
-*.pyo
+venv/
 output/
 *.pdf
-venv/
-.venv/
-.env
-*.egg-info/
-dist/
-build/
-.DS_Store
-Thumbs.db

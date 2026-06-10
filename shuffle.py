@@ -1,290 +1,354 @@
 """
-shuffle.py — Shuffle answer choices in a closed-question exam PDF.
+shuffle.py — Shuffle answer choices in Hebrew exam PDFs.
 
-Usage:
-    python shuffle.py exam.pdf [--seed N] [--out output.pdf] [--dpi 200]
+Uses PyMuPDF to render pages and detect structure.
+Only the CONTENT area of each answer (left of the letter column) is
+shuffled — the letter labels (א/ב/ג/ד/ה) remain in place.
 
-- Open questions (Part A) are kept unchanged.
-- Closed questions (tagged [q1]–[q10]): answer choices (tagged [a]) are shuffled.
-- Images and math formulas inside answers are preserved via image-crop overlay.
+Public API used by app.py:
+    shuffle_exam(input_path, output_path, seed)
 """
 
-import argparse
 import random
 import re
-import sys
-from pathlib import Path
-from datetime import datetime
-
-import pdfplumber
-from pdf2image import convert_from_path
-from PIL import Image, ImageDraw
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas as rl_canvas
 import io
+from pathlib import Path
 
+import fitz                          # PyMuPDF
+from PIL import Image, ImageDraw, ImageFont
 
-PADDING = 5  # points of extra space above each answer crop
+# x0 threshold (PDF points) — letter labels sit at x0 ≥ this value
+_LETTER_X_MIN = 528
+_GARBLE_OFFSET = 0x0330
+_ANSWER_LETTERS = set("אבגדה")
 
+# ── Hebrew decoding ──────────────────────────────────────────────────────────
 
-def find_poppler():
-    import shutil
-    import glob as _glob
-    if shutil.which("pdftoppm"):
-        return None
-    search_roots = [
-        r"C:\Program Files\poppler\bin",
-        r"C:\poppler\bin",
-        r"C:\tools\poppler\bin",
-    ]
-    # Also check winget package install location
-    import os
-    winget_base = os.path.expandvars(
-        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"
-    )
-    for match in _glob.glob(os.path.join(winget_base, "*Poppler*", "**", "bin"), recursive=True):
-        if Path(match, "pdftoppm.exe").exists():
-            return match
-    for path in search_roots:
-        if Path(path, "pdftoppm.exe").exists():
-            return path
-    return None
-
-
-def parse_markers(pdf_path):
+def _decode(text):
     """
-    Return (markers, page_heights).
-    markers: list of dicts {type:'q'|'a', num:int|None, page:int, top:float, bottom:float}
-    page_heights: list of float (PDF points), one per page
+    Decode a garbled Hebrew span from PyMuPDF.
+    Chars in IPA range (U+02A0–U+02BA) are shifted +0x0330 to Hebrew Unicode,
+    and each resulting Hebrew word is reversed (PDF stores RTL words LTR).
+    ASCII/Latin characters pass through unchanged.
     """
-    markers = []
-    page_heights = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_idx, page in enumerate(pdf.pages):
-            page_heights.append(page.height)
-            words = page.extract_words(
-                x_tolerance=5, y_tolerance=5, keep_blank_chars=True
-            )
-            for word in words:
-                text = word["text"].strip()
-                # [qN] or ]qN[ (RTL reversal)
-                m = re.match(r"^[\[\]]q(\d+)[\[\]]$", text)
-                if m:
-                    markers.append(
-                        {
-                            "type": "q",
-                            "num": int(m.group(1)),
-                            "page": page_idx,
-                            "top": word["top"],
-                            "bottom": word["bottom"],
-                        }
-                    )
-                elif text == "[a]":
-                    markers.append(
-                        {
-                            "type": "a",
-                            "num": None,
-                            "page": page_idx,
-                            "top": word["top"],
-                            "bottom": word["bottom"],
-                        }
-                    )
-    return markers, page_heights
+    result = []
+    word = []
+    for ch in text:
+        if 0x02A0 <= ord(ch) <= 0x02BA:
+            word.append(chr(ord(ch) + _GARBLE_OFFSET))
+        else:
+            if word:
+                result.append("".join(reversed(word)))
+                word = []
+            result.append(ch)
+    if word:
+        result.append("".join(reversed(word)))
+    return "".join(result)
 
 
-def build_question_answer_slots(markers, page_heights):
+def _is_answer_letter(span):
+    """Return True if this span is a single answer letter (א-ה)."""
+    dec = _decode(span["text"]).strip(".").strip()
+    return dec in _ANSWER_LETTERS and span["bbox"][0] >= _LETTER_X_MIN
+
+
+# ── Structure detection ──────────────────────────────────────────────────────
+
+def _all_spans(page):
+    """Return all text spans on a page as a flat list."""
+    spans = []
+    for b in page.get_text("dict")["blocks"]:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                spans.append(span)
+    return spans
+
+
+def _parse_structure(pdf_path):
     """
-    Returns dict: {q_num: [slot, ...]}
-    slot = {'page': int, 'y_top': float, 'y_bottom': float}
+    Detect question boundaries and answer letter positions.
+
+    Returns
+    -------
+    questions : dict
+        {q_num: {'page': int, 'slots': [{'y_top': f, 'y_bot': f}, ...]}}
+        Slots are ordered א → ב → ג → ד → ה.
+    code_spans : list
+        [{'page': int, 'bbox': (x0,y0,x1,y1)}]  — '0000' placeholder spans.
+    page_heights : list[float]
+        PDF point height of each page.
     """
-    sorted_m = sorted(markers, key=lambda m: (m["page"], m["top"]))
+    doc = fitz.open(str(pdf_path))
     questions = {}
-    current_q = None
+    code_spans = []
+    page_heights = []
 
-    for i, marker in enumerate(sorted_m):
-        if marker["type"] == "q":
-            current_q = marker["num"]
-            questions.setdefault(current_q, [])
-        elif marker["type"] == "a" and current_q is not None:
-            next_m = sorted_m[i + 1] if i + 1 < len(sorted_m) else None
-            if next_m and next_m["page"] == marker["page"] and next_m["type"] == "a":
-                y_bottom = next_m["top"] - PADDING
-                hit_page_bottom = False
-            elif next_m and next_m["page"] == marker["page"]:
-                # Next marker is [q] on same page — slot may span into next question's content
-                y_bottom = next_m["top"] - PADDING
-                hit_page_bottom = True
-            else:
-                y_bottom = page_heights[marker["page"]] - PADDING
-                hit_page_bottom = True
+    for page_idx, page in enumerate(doc):
+        page_heights.append(page.rect.height)
+        spans = _all_spans(page)
 
-            questions[current_q].append(
-                {
-                    "page": marker["page"],
-                    "y_top": marker["top"] - PADDING,
-                    "y_bottom": y_bottom,
-                    "_hit_page_bottom": hit_page_bottom,
-                }
-            )
+        # ── '0000' code placeholder ──────────────────────────────────────────
+        for span in spans:
+            if re.fullmatch(r"0+", span["text"].strip()):
+                code_spans.append({"page": page_idx, "bbox": span["bbox"]})
 
-    # Cap slots that extend to page bottom: limit to the max height of
-    # same-question slots whose bottom was set by a real next-marker.
-    for slots in questions.values():
-        normal_heights = [
-            s["y_bottom"] - s["y_top"]
-            for s in slots if not s["_hit_page_bottom"]
-        ]
-        if normal_heights:
-            cap = max(normal_heights)
-            for slot in slots:
-                if slot["_hit_page_bottom"]:
-                    slot["y_bottom"] = min(
-                        slot["y_bottom"], slot["y_top"] + cap
-                    )
-        for slot in slots:
-            del slot["_hit_page_bottom"]
+        # ── Answer letter positions ──────────────────────────────────────────
+        letter_spans = [s for s in spans if _is_answer_letter(s)]
+        letter_spans.sort(key=lambda s: s["bbox"][1])   # sort by y
 
-    return questions
+        # ── Question header positions (look for "שאלה" word + digit nearby) ─
+        q_y = {}    # {q_num: y_of_header}
+        for span in spans:
+            dec = _decode(span["text"]).strip()
+            if "שאלה" in dec:
+                y_ref = span["bbox"][1]
+                for other in spans:
+                    if abs(other["bbox"][1] - y_ref) < 6:
+                        nums = re.findall(r"\d+", other["text"])
+                        for n in nums:
+                            n = int(n)
+                            if 1 <= n <= 500:
+                                q_y[n] = y_ref
+
+        if not q_y or not letter_spans:
+            continue
+
+        sorted_q = sorted(q_y.items(), key=lambda x: x[1])
+
+        for qi, (q_num, q_hdr_y) in enumerate(sorted_q):
+            next_q_y = sorted_q[qi + 1][1] if qi + 1 < len(sorted_q) else page.rect.height
+
+            # Letters belonging to this question
+            q_letters = [ls for ls in letter_spans if q_hdr_y < ls["bbox"][1] < next_q_y]
+            q_letters.sort(key=lambda s: s["bbox"][1])
+
+            if len(q_letters) < 2:
+                continue
+
+            # Build slots: each slot spans from this letter's y to the next
+            slots = []
+            for li, ls in enumerate(q_letters):
+                if li + 1 < len(q_letters):
+                    y_bot = q_letters[li + 1]["bbox"][1] - 1
+                else:
+                    y_bot = next_q_y - 1
+                slots.append({
+                    "y_top": ls["bbox"][1],
+                    "y_bot": y_bot,
+                })
+
+            # Cap the last slot to the typical slot height so it doesn't
+            # extend all the way to the next question header.
+            if len(slots) > 1:
+                step = q_letters[1]["bbox"][1] - q_letters[0]["bbox"][1]
+                slots[-1]["y_bot"] = min(
+                    slots[-1]["y_bot"],
+                    slots[-1]["y_top"] + step + 2,
+                )
+
+            questions[q_num] = {"page": page_idx, "slots": slots}
+
+    doc.close()
+    return questions, code_spans, page_heights
 
 
-def pdf_to_images(pdf_path, dpi, poppler_path):
-    return convert_from_path(str(pdf_path), dpi=dpi, poppler_path=poppler_path)
+# ── Page rendering ───────────────────────────────────────────────────────────
+
+def _render_pages(pdf_path, dpi=200):
+    """Render all PDF pages to PIL images using PyMuPDF."""
+    doc = fitz.open(str(pdf_path))
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    doc.close()
+    return images
 
 
-def crop_slot(page_images, page_heights, slot, dpi):
-    page_idx = slot["page"]
-    img = page_images[page_idx]
-    img_w, img_h = img.size
-    pdf_h = page_heights[page_idx]
-    scale = img_h / pdf_h
+# ── Answer shuffling ─────────────────────────────────────────────────────────
 
-    y_top_px = max(0, int(slot["y_top"] * scale))
-    y_bot_px = min(img_h, int(slot["y_bottom"] * scale))
-
-    return img.crop((0, y_top_px, img_w, y_bot_px))
-
-
-def shuffle_answers(page_images, page_heights, questions, seed, dpi):
+def _shuffle_content(page_images, page_heights, questions, rng, dpi):
     """
-    For each question, crop all answer images, shuffle them,
-    then white-out the original slots and paste the shuffled crops back.
-    Returns modified page images (copies of originals).
+    Shuffle ONLY the content area (x=0 … _LETTER_X_MIN) of each answer slot.
+    Letter labels at x ≥ _LETTER_X_MIN are never touched.
+
+    Returns modified copies of page_images.
     """
-    rng = random.Random(seed)
     modified = [img.copy() for img in page_images]
 
     for q_num in sorted(questions):
-        slots = questions[q_num]
+        q_info = questions[q_num]
+        page_idx = q_info["page"]
+        slots = q_info["slots"]
+
         if len(slots) < 2:
             continue
 
-        # Crop originals
-        crops = [crop_slot(page_images, page_heights, s, dpi) for s in slots]
+        img_ref = page_images[page_idx]
+        pdf_h = page_heights[page_idx]
+        scale = img_ref.size[1] / pdf_h
+        letter_x_px = int(_LETTER_X_MIN * scale)
 
-        # Shuffle
+        # Crop content area for each slot
+        crops = []
+        for slot in slots:
+            img_s = page_images[page_idx]   # same page per question
+            y_top_px = max(0, int(slot["y_top"] * scale))
+            y_bot_px = min(img_s.size[1], int(slot["y_bot"] * scale))
+            trim = max(1, int(2 * scale))   # trim bottom edge to avoid bleed
+            crop = img_s.crop((0, y_top_px, letter_x_px, y_bot_px - trim))
+            crops.append({"crop": crop, "h": y_bot_px - y_top_px})
+
         shuffled = crops[:]
         rng.shuffle(shuffled)
 
-        # Paste back
-        for slot, crop in zip(slots, shuffled):
-            page_idx = slot["page"]
-            img = modified[page_idx]
-            img_w, img_h = img.size
-            pdf_h = page_heights[page_idx]
-            scale = img_h / pdf_h
-
+        # White-out originals and paste shuffled crops
+        mod_img = modified[page_idx]
+        for slot, new_info in zip(slots, shuffled):
             y_top_px = max(0, int(slot["y_top"] * scale))
-            y_bot_px = min(img_h, int(slot["y_bottom"] * scale))
+            y_bot_px = min(mod_img.size[1], int(slot["y_bot"] * scale))
             slot_h = y_bot_px - y_top_px
-            crop_h = crop.size[1]
 
-            # White out original slot (expand if crop is taller to prevent overflow)
-            draw = ImageDraw.Draw(img)
-            wipe_bot = min(img_h, max(y_bot_px, y_top_px + crop_h))
-            draw.rectangle([(0, y_top_px), (img_w, wipe_bot)], fill="white")
+            draw = ImageDraw.Draw(mod_img)
+            extra = int(4 * scale)
+            draw.rectangle([(0, y_top_px), (letter_x_px, min(mod_img.size[1], y_bot_px + extra))], fill="white")
 
-            # Scale down only if crop is taller than slot; never scale up
-            if crop_h > slot_h > 0:
-                crop = crop.resize((img_w, slot_h), Image.LANCZOS)
+            crop = new_info["crop"]
+            if crop.size[1] != slot_h and slot_h > 0:
+                crop = crop.resize((letter_x_px, slot_h), Image.LANCZOS)
 
-            img.paste(crop, (0, y_top_px))
+            mod_img.paste(crop, (0, y_top_px))
 
     return modified
 
 
-def save_as_pdf(page_images, out_path, pdf_path, dpi):
-    """
-    Save the modified page images as a PDF preserving original page dimensions.
-    Uses reportlab so page size matches the source PDF exactly.
-    """
-    with pdfplumber.open(pdf_path) as pdf:
-        page_sizes = [(p.width, p.height) for p in pdf.pages]
+# ── Code stamping ────────────────────────────────────────────────────────────
 
-    c = rl_canvas.Canvas(str(out_path))
-    for i, (img, (pdf_w, pdf_h)) in enumerate(zip(page_images, page_sizes)):
-        c.setPageSize((pdf_w, pdf_h))
-        # Convert PIL image to bytes
+def _stamp_code(page_images, page_heights, code_spans, seed):
+    """Replace '0000' placeholders with a deterministic 4-digit code."""
+    code = str(seed % 9000 + 1000)
+    result = [img.copy() for img in page_images]
+
+    for cs in code_spans:
+        page_idx = cs["page"]
+        img = result[page_idx]
+        img_w, img_h = img.size
+        pdf_h = page_heights[page_idx]
+        scale = img_h / pdf_h
+
+        x0, y0, x1, y1 = cs["bbox"]
+        px0 = max(0, int(x0 * scale) - 2)
+        px1 = min(img_w, int(x1 * scale) + 2)
+        py0 = max(0, int(y0 * scale) - 2)
+        py1 = min(img_h, int(y1 * scale) + 2)
+
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([(px0, py0), (px1, py1)], fill="white")
+
+        box_h = py1 - py0
+        font_size = max(8, int(box_h * 0.85))
+        font = None
+        for face in ("arial.ttf", "Arial.ttf", "DejaVuSans.ttf"):
+            try:
+                font = ImageFont.truetype(face, font_size)
+                break
+            except Exception:
+                pass
+        if font is None:
+            font = ImageFont.load_default()
+
+        try:
+            tb = draw.textbbox((0, 0), code, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        except Exception:
+            tw, th = font_size * len(code) // 2, font_size
+
+        tx = px0 + ((px1 - px0) - tw) // 2
+        ty = py0 + ((py1 - py0) - th) // 2
+        draw.text((tx, ty), code, fill="black", font=font)
+
+    return result
+
+
+# ── PDF output ───────────────────────────────────────────────────────────────
+
+def _save_pdf(page_images, page_sizes, out_path, dpi=200):
+    """Save PIL images as a multi-page PDF using PyMuPDF."""
+    doc = fitz.open()
+    for img, (pdf_w, pdf_h) in zip(page_images, page_sizes):
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=92, dpi=(dpi, dpi))
-        buf.seek(0)
-        c.drawImage(
-            rl_canvas.ImageReader(buf),
-            0, 0,
-            width=pdf_w,
-            height=pdf_h,
-            preserveAspectRatio=False,
-        )
-        c.showPage()
-    c.save()
+        img.convert("RGB").save(buf, format="JPEG", quality=93)
+        page = doc.new_page(width=pdf_w, height=pdf_h)
+        page.insert_image(page.rect, stream=buf.getvalue())
+    doc.save(str(out_path))
+    doc.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Shuffle closed-question answer choices in an exam PDF"
-    )
-    parser.add_argument("pdf", help="Input exam PDF")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: random)")
-    parser.add_argument("--out", default=None, help="Output PDF path")
-    parser.add_argument("--dpi", type=int, default=200, help="Render resolution (default: 200)")
+# ── Public entry point ───────────────────────────────────────────────────────
+
+def shuffle_exam(input_path, output_path, seed, dpi=200):
+    """
+    Shuffle answer choices in a Hebrew exam PDF.
+
+    Parameters
+    ----------
+    input_path  : Path or str — input PDF
+    output_path : Path or str — where to write the result
+    seed        : int         — randomisation seed
+    dpi         : int         — render resolution (default 200)
+
+    Returns
+    -------
+    questions_found : int   — number of shuffled questions
+    exam_code       : str   — 4-digit code stamped on the exam
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    rng = random.Random(seed)
+
+    questions, code_spans, page_heights = _parse_structure(input_path)
+    page_images = _render_pages(input_path, dpi=dpi)
+    page_sizes = [(fitz.open(str(input_path))[i].rect.width,
+                   fitz.open(str(input_path))[i].rect.height)
+                  for i in range(len(page_images))]
+
+    modified = _shuffle_content(page_images, page_heights, questions, rng, dpi)
+    modified = _stamp_code(modified, page_heights, code_spans, seed)
+
+    _save_pdf(modified, page_sizes, output_path, dpi)
+
+    exam_code = str(seed % 9000 + 1000)
+    return len(questions), exam_code
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse, sys
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(description="Shuffle Hebrew exam answers")
+    parser.add_argument("pdf")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--dpi", type=int, default=200)
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
     if not pdf_path.exists():
-        print(f"Error: file not found: {pdf_path}", file=sys.stderr)
+        print(f"Error: {pdf_path} not found", file=sys.stderr)
         sys.exit(1)
 
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
+    seed = args.seed if args.seed is not None else random.randint(0, 2 ** 31)
+    out = Path(args.out) if args.out else out_dir / f"shuffled_{seed}.pdf"
 
-    if args.out:
-        out_path = Path(args.out)
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"shuffled_{ts}.pdf"
-
-    poppler_path = find_poppler()
-
-    print("Parsing PDF structure...")
-    markers, page_heights = parse_markers(pdf_path)
-    questions = build_question_answer_slots(markers, page_heights)
-
-    q_nums = sorted(questions)
-    print(f"Found {len(q_nums)} closed question(s): {q_nums}")
-    for n in q_nums:
-        print(f"  Q{n}: {len(questions[n])} answer choices")
-
-    print(f"\nConverting {len(page_heights)} pages to images at {args.dpi} DPI...")
-    page_images = pdf_to_images(pdf_path, dpi=args.dpi, poppler_path=poppler_path)
-
-    seed = args.seed if args.seed is not None else random.randint(0, 2**31)
-    print(f"Shuffling answers (seed={seed})...")
-    modified = shuffle_answers(page_images, page_heights, questions, seed, args.dpi)
-
-    print(f"Saving to {out_path}...")
-    save_as_pdf(modified, out_path, pdf_path, args.dpi)
-    print(f"\nDone!  {out_path}")
-    print(f"Seed used: {seed}  (pass --seed {seed} to reproduce this shuffle)")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Parsing + shuffling (seed={seed})…")
+    n_q, code = shuffle_exam(pdf_path, out, seed, dpi=args.dpi)
+    print(f"Done: {n_q} questions shuffled, exam code = {code}")
+    print(f"Output: {out}")

@@ -11,14 +11,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from shuffle import (
-    build_question_answer_slots,
-    find_poppler,
-    parse_markers,
-    pdf_to_images,
-    save_as_pdf,
-    shuffle_answers,
-)
+from shuffle import shuffle_exam
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
@@ -187,13 +180,7 @@ def shuffle_endpoint():
         f.save(input_path)
 
         try:
-            poppler_path = find_poppler()
-            markers, page_heights = parse_markers(input_path)
-            questions = build_question_answer_slots(markers, page_heights)
-            page_images = pdf_to_images(input_path, dpi=200, poppler_path=poppler_path)
-            modified = shuffle_answers(page_images, page_heights, questions, seed, 200)
-            save_as_pdf(modified, output_path, input_path, 200)
-
+            shuffle_exam(input_path, output_path, seed)
             buf = io.BytesIO(output_path.read_bytes())
 
         except Exception as e:
